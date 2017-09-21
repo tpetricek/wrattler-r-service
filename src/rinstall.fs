@@ -22,7 +22,9 @@ let ensureR () =
         CreateNoWindow = true, StandardErrorEncoding = Encoding.UTF8, StandardOutputEncoding = Encoding.UTF8)
   let proc = Process.Start(psi)
   proc.WaitForExit()
-  while (not (proc.StandardOutput.EndOfStream)) do printfn "out: %s" (proc.StandardOutput.ReadLine())
-  while (not (proc.StandardError.EndOfStream)) do printfn "err: %s" (proc.StandardOutput.ReadLine())
-  if proc.ExitCode <> 0 then invalidOp "Failed to install R in local context"
+  let log = 
+    String.concat "\n"
+      [ while (not (proc.StandardOutput.EndOfStream)) do yield proc.StandardOutput.ReadLine()
+        while (not (proc.StandardError.EndOfStream)) do yield proc.StandardOutput.ReadLine() ]
+  if proc.ExitCode <> 0 then failwithf "Failed to install R in local context (%d): \n%s" proc.ExitCode log
   printf "R installation complete."
