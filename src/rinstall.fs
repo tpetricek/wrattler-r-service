@@ -2,6 +2,7 @@
 
 open System
 open System.IO
+open System.Text
 open System.Diagnostics
 
 let ensureR () = 
@@ -14,9 +15,14 @@ let ensureR () =
   printfn "Downloading R bits..."
   wc.DownloadFile(Uri installer, tmpExe)
   printf "Installing R..."
-  let psi = new ProcessStartInfo(tmpExe, "/COMPONENTS=x64,main,translation /SILENT")
-  psi.UseShellExecute <- false
+  let psi = 
+    new ProcessStartInfo
+      ( tmpExe, "/COMPONENTS=x64,main,translation", 
+        UseShellExecute = false, RedirectStandardError = true, RedirectStandardOutput = true, 
+        CreateNoWindow = true, StandardErrorEncoding = Encoding.UTF8, StandardOutputEncoding = Encoding.UTF8)
   let proc = Process.Start(psi)
   proc.WaitForExit()
+  while (not (proc.StandardOutput.EndOfStream)) do printfn "out: %s" (proc.StandardOutput.ReadLine())
+  while (not (proc.StandardError.EndOfStream)) do printfn "err: %s" (proc.StandardOutput.ReadLine())
   if proc.ExitCode <> 0 then invalidOp "Failed to install R in local context"
   printf "R installation complete."
