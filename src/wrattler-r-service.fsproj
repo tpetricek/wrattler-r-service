@@ -8,7 +8,7 @@
     <ProjectGuid>23203630-a90f-4743-96e9-f7d8017c74b3</ProjectGuid>
     <OutputType>Exe</OutputType>
     <RootNamespace>DataSources</RootNamespace>
-    <AssemblyName>autocomplete</AssemblyName>
+    <AssemblyName>wrattler-r-service</AssemblyName>
     <TargetFrameworkVersion>v4.5.2</TargetFrameworkVersion>
     <TargetFSharpCoreVersion>4.4.0.0</TargetFSharpCoreVersion>
     <AutoGenerateBindingRedirects>true</AutoGenerateBindingRedirects>

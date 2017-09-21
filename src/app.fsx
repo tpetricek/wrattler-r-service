@@ -78,6 +78,7 @@ let getResults code rengine =
 type ExportsJson = JsonProvider<"""[
   { "variable":"foo",
     "type":{"kind":"frame", "columns":[["foo", "string"],["bar", "int"]]}} ]""">
+
 type EvalJson = JsonProvider<"""[
   { "variable":"foo",
     "data":[] } ]""">
