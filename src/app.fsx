@@ -4,20 +4,24 @@
 #r "../packages/R.NET/lib/net40/RDotNet.dll"
 #r "../packages/R.NET.FSharp/lib/net40/RDotNet.FSharp.dll"
 #r "../packages/FSharp.Data/lib/net40/FSharp.Data.dll"
+#load "rinstall.fs"
 #else
 module Wrattler.RService
 #endif
 open Suave
-open System
 open Suave.Filters
 open Suave.Writers
 open Suave.Operators
-open FSharp.Data
+
+open System
 open RDotNet
+open FSharp.Data
 
 // ------------------------------------------------------------------------------------------------
 // Thread-safe R engine access
 // ------------------------------------------------------------------------------------------------
+
+RInstall.ensureR()
 
 let queue = new System.Collections.Concurrent.BlockingCollection<_>()
 let worker = System.Threading.Thread(fun () -> 

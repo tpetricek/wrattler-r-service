@@ -3,6 +3,7 @@
 // --------------------------------------------------------------------------------------
 
 #r "packages/FAKE/tools/FakeLib.dll"
+#load "src/rinstall.fs"
 open Fake
 open System
 open System.IO
@@ -73,6 +74,9 @@ let newName prefix f =
   Seq.initInfinite (sprintf "%s_%d" prefix) |> Seq.skipWhile (f >> not) |> Seq.head
 
 Target "deploy" (fun _ ->
+  // Install R on the current machine
+  RInstall.ensureR()
+
   // Pick a subfolder that does not exist
   let wwwroot = "../wwwroot"
   let subdir = newName "deploy" (fun sub -> not (Directory.Exists(wwwroot </> sub)))
