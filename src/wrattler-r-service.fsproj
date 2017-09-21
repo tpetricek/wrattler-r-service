@@ -60,6 +60,7 @@
   -->
   <ItemGroup>
     <None Include="paket.references" />
+    <Compile Include="rinstall.fs" />
     <Compile Include="app.fsx" />
   </ItemGroup>
   <ItemGroup>
