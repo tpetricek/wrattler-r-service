@@ -1,0 +1,8 @@
+.vs
+bin
+.paket/paket.exe
+packages
+paket-files
+obj
+.fake/
+src/config.fs

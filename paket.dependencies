@@ -1,0 +1,10 @@
+framework: >= net40
+source https://nuget.org/api/v2
+
+nuget FAKE
+nuget Suave
+nuget FSharp.Compiler.Tools
+nuget FSharp.Compiler.Service
+nuget R.NET
+nuget R.NET.FSharp
+nuget FSharp.Data
