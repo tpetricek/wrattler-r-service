@@ -4,7 +4,6 @@
 #r "../packages/R.NET/lib/net40/RDotNet.dll"
 #r "../packages/R.NET.FSharp/lib/net40/RDotNet.FSharp.dll"
 #r "../packages/FSharp.Data/lib/net40/FSharp.Data.dll"
-#load "rinstall.fs"
 #else
 module Wrattler.RService
 #endif
@@ -21,11 +20,13 @@ open FSharp.Data
 // Thread-safe R engine access
 // ------------------------------------------------------------------------------------------------
 
-RInstall.ensureR()
-
 let queue = new System.Collections.Concurrent.BlockingCollection<_>()
 let worker = System.Threading.Thread(fun () -> 
-  let rengine = REngine.GetInstance(AutoPrint=false)
+  let rpath = __SOURCE_DIRECTORY__ + "/../rinstall/R-3.4.1" |> IO.Path.GetFullPath
+  let path = System.Environment.GetEnvironmentVariable("PATH")
+  System.Environment.SetEnvironmentVariable("PATH", sprintf "%s;%s/bin/x64" path rpath)
+  System.Environment.SetEnvironmentVariable("R_HOME", rpath)
+  let rengine = REngine.GetInstance(rpath + "/bin/x64\R.dll", AutoPrint=false)
   while true do 
     let op = queue.Take() 
     op rengine )
@@ -74,6 +75,9 @@ let getResults code rengine =
       var, 
       [| for row in df.GetRows() ->
            df.ColumnNames |> Array.map (fun c -> c, row.[c]) |] ]
+
+//Async.RunSynchronously <| withREngine (getExports "data <- iris\nagg <- aggregate(Petal.Width~Species, data, mean)")
+//Async.RunSynchronously <| withREngine (getResults "data <- iris\nagg <- aggregate(Petal.Width~Species, data, mean)")
 
 // --------------------------------------------------------------------------------------
 // Server that exposes the R functionality

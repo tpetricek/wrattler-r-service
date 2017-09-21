@@ -3,7 +3,6 @@
 // --------------------------------------------------------------------------------------
 
 #r "packages/FAKE/tools/FakeLib.dll"
-#load "src/rinstall.fs"
 open Fake
 open System
 open System.IO
@@ -75,7 +74,10 @@ let newName prefix f =
 
 Target "deploy" (fun _ ->
   // Install R on the current machine
-  RInstall.ensureR()
+  use wc = new Net.WebClient()
+  CleanDir "rinstall"
+  wc.DownloadFile("https://wrattlerdata.blob.core.windows.net/install/R-3.4.1.zip", "rinstall/R-3.4.1.zip")
+  Unzip "rinstall" "rinstall/R-3.4.1.zip"
 
   // Pick a subfolder that does not exist
   let wwwroot = "../wwwroot"
