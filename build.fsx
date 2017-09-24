@@ -30,6 +30,44 @@ Target "build" (fun _ ->
 "clean" ==> "build"
 
 // --------------------------------------------------------------------------------------
+// Azure - deploy copies the binary to wwwroot/bin
+// --------------------------------------------------------------------------------------
+
+Target "installr" (fun _ ->
+  if not (File.Exists("rinstall/R-3.4.1.zip")) then
+    use wc = new Net.WebClient()
+    CleanDir "rinstall"
+    wc.DownloadFile("https://wrattlerdata.blob.core.windows.net/install/R-3.4.1.zip", "rinstall/R-3.4.1.zip")
+    Unzip "rinstall" "rinstall/R-3.4.1.zip"
+)
+
+let newName prefix f = 
+  Seq.initInfinite (sprintf "%s_%d" prefix) |> Seq.skipWhile (f >> not) |> Seq.head
+
+Target "deploy" (fun _ ->
+  // Pick a subfolder that does not exist
+  let wwwroot = "../wwwroot"
+  let subdir = newName "deploy" (fun sub -> not (Directory.Exists(wwwroot </> sub)))
+  
+  // Deploy everything into new empty folder
+  let deployroot = wwwroot </> subdir
+  CleanDir deployroot
+  CleanDir (deployroot </> "bin")
+  CopyRecursive "bin" (deployroot </> "bin") false |> ignore
+  
+  let config = File.ReadAllText("web.config").Replace("%DEPLOY_SUBDIRECTORY%", subdir)
+  File.WriteAllText(wwwroot </> "web.config", config)
+
+  // Try to delete previous folders, but ignore failures
+  for dir in Directory.GetDirectories(wwwroot) do
+    if Path.GetFileName(dir) <> subdir then 
+      try CleanDir dir; DeleteDir dir with _ -> ()
+)
+
+"installr" ==> "deploy"
+"build" ==> "deploy"
+
+// --------------------------------------------------------------------------------------
 // For local run - automatically reloads scripts
 // --------------------------------------------------------------------------------------
 
@@ -64,39 +102,6 @@ Target "run" (fun _ ->
 )
 
 "start" ==> "run"
+"installr" ==> "start"
 
-// --------------------------------------------------------------------------------------
-// Azure - deploy copies the binary to wwwroot/bin
-// --------------------------------------------------------------------------------------
-
-let newName prefix f = 
-  Seq.initInfinite (sprintf "%s_%d" prefix) |> Seq.skipWhile (f >> not) |> Seq.head
-
-Target "deploy" (fun _ ->
-  // Install R on the current machine
-  use wc = new Net.WebClient()
-  CleanDir "rinstall"
-  wc.DownloadFile("https://wrattlerdata.blob.core.windows.net/install/R-3.4.1.zip", "rinstall/R-3.4.1.zip")
-  Unzip "rinstall" "rinstall/R-3.4.1.zip"
-
-  // Pick a subfolder that does not exist
-  let wwwroot = "../wwwroot"
-  let subdir = newName "deploy" (fun sub -> not (Directory.Exists(wwwroot </> sub)))
-  
-  // Deploy everything into new empty folder
-  let deployroot = wwwroot </> subdir
-  CleanDir deployroot
-  CleanDir (deployroot </> "bin")
-  CopyRecursive "bin" (deployroot </> "bin") false |> ignore
-  
-  let config = File.ReadAllText("web.config").Replace("%DEPLOY_SUBDIRECTORY%", subdir)
-  File.WriteAllText(wwwroot </> "web.config", config)
-
-  // Try to delete previous folders, but ignore failures
-  for dir in Directory.GetDirectories(wwwroot) do
-    if Path.GetFileName(dir) <> subdir then 
-      try CleanDir dir; DeleteDir dir with _ -> ()
-)
-
-"build" ==> "deploy"
 RunTargetOrDefault "run"

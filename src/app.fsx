@@ -40,11 +40,46 @@ let withREngine op =
     )
   )
 
-let evaluate code (rengine:REngine) = 
-  let code = sprintf "e <- new.env(); with(e, { %s })" code
+let getConvertor (rengine:REngine) = function 
+  | JsonValue.Boolean _ -> fun data -> 
+      data |> Seq.map (function JsonValue.Boolean b -> b | _ -> failwith "Expected boolean") |> rengine.CreateLogicalVector :> SymbolicExpression
+  | JsonValue.Number _ -> fun data -> 
+      data |> Seq.map (function JsonValue.Number n -> float n | JsonValue.Float n -> n | _ -> failwith "Expected number") |> rengine.CreateNumericVector :> _ 
+  | JsonValue.Float _ -> fun data -> 
+      data |> Seq.map (function JsonValue.Number n -> float n | JsonValue.Float n -> n | _ -> failwith "Expected number") |> rengine.CreateNumericVector :> _ 
+  | JsonValue.String _ -> fun data -> 
+      data |> Seq.map (function JsonValue.String s -> s | _ -> failwith "Expected tring") |> rengine.CreateCharacterVector :> _ 
+  | _ -> failwith "Unexpected json value"
+
+let evaluate frames code (rengine:REngine) = 
+
+  let mainEnv = rengine.Evaluate("new.env()").AsEnvironment()
+  let tmpEnv = rengine.Evaluate("new.env()").AsEnvironment()
+  rengine.SetSymbol("tmpEnv", tmpEnv)
+  rengine.SetSymbol("mainEnv", mainEnv)
+
+  for name, data in frames do
+    let props = 
+      match Array.head data with 
+      | JsonValue.Record props -> props |> Array.map (fun (k, v) -> 
+          k, getConvertor rengine v )
+      | _ -> failwith "Expected record"
+    let cols = props |> Seq.map (fun (p, _) -> p, ResizeArray<_>()) |> dict
+    for row in data do
+      match row with 
+      | JsonValue.Record recd -> for k, v in recd do cols.[k].Add(v)
+      | _ -> failwith "Expected record"
+    props |> Seq.iteri (fun i (n, conv) ->
+      rengine.SetSymbol("tmp" + string i, conv cols.[n], tmpEnv))  
+    let assigns = props |> Seq.mapi (fun i (n, _) -> sprintf "'%s'=tmpEnv$tmp%d" n i)
+    let df = rengine.Evaluate(sprintf "data.frame(%s)" (String.concat "," assigns)).AsDataFrame()
+    df.SetAttribute("names", rengine.CreateCharacterVector (Array.map fst props))
+    rengine.SetSymbol(name, df, mainEnv)
+
+  let code = sprintf "with(mainEnv, { %s })" code
   rengine.Evaluate(code) |> ignore
-  [ for var in rengine.Evaluate("ls(e)").AsCharacter() do
-      match rengine.Evaluate("as.data.frame(e$" + var + ")") with
+  [ for var in rengine.Evaluate("ls(mainEnv)").AsCharacter() do
+      match rengine.Evaluate("as.data.frame(mainEnv$" + var + ")") with
       | ActivePatterns.DataFrame df -> yield var, df
       | _ -> () ] 
 
@@ -61,8 +96,8 @@ let formatType typ =
   elif typ = typeof<System.String> then "string"
   else failwithf "Unsupported type: %s" (typ.FullName)
 
-let getExports code rengine = 
-  [ for var, df in evaluate code rengine ->      
+let getExports frames code rengine = 
+  [ for var, df in evaluate frames code rengine ->      
       let row = df.GetRows() |> Seq.tryHead
       let tys = 
         match row with
@@ -70,11 +105,23 @@ let getExports code rengine =
         | None -> df.ColumnNames |> Array.map (fun c -> c, "object")
       var, List.ofArray tys ]
 
-let getResults code rengine =
-  [ for var, df in evaluate code rengine ->      
+let getResults frames code rengine =
+  [ for var, df in evaluate frames code rengine ->      
       var, 
       [| for row in df.GetRows() ->
            df.ColumnNames |> Array.map (fun c -> c, row.[c]) |] ]
+
+(*
+Async.RunSynchronously <| withREngine (fun rengine ->
+  let q = rengine.Evaluate("q <- quote({ print('hi')\ndata <- iris\nagg <- aggregate(Petal.Width~Species, data, mean)\ncolnames(agg)[2] <- \"PetalWidth\" })")
+  let count = rengine.Evaluate("length(q)").AsNumeric().[0] |> int
+  for i in 2 .. count do
+    let call = rengine.Evaluate(sprintf "as.list(q[%d][[1]])" i).AsCharacter()
+    if call.Length > 0 && call.[0] = "`<-`" then
+      if rengine.Evaluate(sprintf "!is.call(as.list(q[%d][[1]])[[2]])" i).AsCharacter().[0] = "TRUE" then
+        rengine.Evaluate(sprintf "as.character(as.list(q[%d][[1]])[[2]])" i).AsCharacter().[0]
+        |> printfn "%s"  )
+*)
 
 //Async.RunSynchronously <| withREngine (getExports "data <- iris\nagg <- aggregate(Petal.Width~Species, data, mean)")
 //Async.RunSynchronously <| withREngine (getResults "data <- iris\nagg <- aggregate(Petal.Width~Species, data, mean)")
@@ -88,9 +135,13 @@ type ExportsJson = JsonProvider<"""[
     "type":{"kind":"frame", "columns":[["foo", "string"],["bar", "int"]]}} ]""">
 
 type EvalJson = JsonProvider<"""[
-  { "variable":"foo",
+  { "name":"foo",
     "data":[] } ]""">
-    
+
+type RequestJson = JsonProvider<"""{ 
+  "code":"a <- b",
+  "frames": [{"name":"b", "data":[]}, {"name":"c", "data":[]}] }""">
+
 let app =
   setHeader  "Access-Control-Allow-Origin" "*"
   >=> setHeader "Access-Control-Allow-Headers" "content-type"
@@ -103,8 +154,8 @@ let app =
 
     POST >=> path "/eval" >=>       
       request (fun req ctx -> async {
-        let code = System.Text.UTF32Encoding.UTF8.GetString(req.rawForm)
-        let! res = withREngine (getResults code)
+        let req = RequestJson.Parse(System.Text.UTF32Encoding.UTF8.GetString(req.rawForm))
+        let! res = withREngine (getResults [| for f in req.Frames -> f.Name, [| for d in f.Data -> d.JsonValue |] |] req.Code)
         let res = 
           [| for var, data in res -> 
               let data = Array.map (Array.map (fun (k, v) -> k, formatValue v) >> JsonValue.Record) data
@@ -114,8 +165,8 @@ let app =
 
     POST >=> path "/exports" >=> 
       request (fun req ctx -> async {
-        let code = System.Text.UTF32Encoding.UTF8.GetString(req.rawForm)
-        let! exp = withREngine (getExports code)
+        let req = RequestJson.Parse(System.Text.UTF32Encoding.UTF8.GetString(req.rawForm))
+        let! exp = withREngine (getExports [| for f in req.Frames -> f.Name, [| for d in f.Data -> d.JsonValue |] |] req.Code)
         let res = 
           [| for var, cols in exp -> 
               let cols = [| for k, v in cols -> [|k; v|] |]
