@@ -11,10 +11,15 @@ open Suave
 open Suave.Filters
 open Suave.Writers
 open Suave.Operators
+open Suave.Logging
 
 open System
 open RDotNet
 open FSharp.Data
+
+let dataStoreUrl = "http://localhost:7102"
+let logger = Targets.create Verbose [||]
+let logf fmt = Printf.kprintf (fun s -> logger.info(Message.eventX s)) fmt
 
 // ------------------------------------------------------------------------------------------------
 // Thread-safe R engine access
@@ -26,7 +31,8 @@ let worker = System.Threading.Thread(fun () ->
   let path = System.Environment.GetEnvironmentVariable("PATH")
   System.Environment.SetEnvironmentVariable("PATH", sprintf "%s;%s/bin/x64" path rpath)
   System.Environment.SetEnvironmentVariable("R_HOME", rpath)
-  let rengine = REngine.GetInstance(rpath + "/bin/x64\R.dll", AutoPrint=false)
+  let rengine = REngine.GetInstance(rpath + "/bin/x64/R.dll", AutoPrint=false)
+  rengine.Evaluate("dataStore <- list()") |> ignore
   while true do 
     let op = queue.Take() 
     op rengine )
@@ -40,6 +46,34 @@ let withREngine op =
     )
   )
 
+// ------------------------------------------------------------------------------------------------
+// Calling data store and caching data
+// ------------------------------------------------------------------------------------------------
+
+let storeDataset hash file json = 
+  Http.AsyncRequestString
+    ( sprintf "%s/%s/%s" dataStoreUrl hash file, 
+      httpMethod="PUT", body = HttpRequestBody.TextRequest json)
+  |> Async.Ignore
+
+type RetrievedFrame = 
+  | Cached of string
+  | Downloaded of JsonValue
+
+let retrieveFrames frames = async {
+  let! known = withREngine(fun rengine ->
+    set (rengine.Evaluate("ls(dataStore)").AsCharacter()))
+  let res = ResizeArray<_>()
+  for var, url in frames do
+    if known.Contains url then res.Add(var, Cached(sprintf "dataStore$`%s`" url)) else
+    let! json = Http.AsyncRequestString(url, httpMethod="GET")
+    res.Add(var, Downloaded(JsonValue.Parse(json))) 
+  return res :> seq<_> }
+
+// ------------------------------------------------------------------------------------------------
+// Calling data store
+// ------------------------------------------------------------------------------------------------
+
 let getConvertor (rengine:REngine) = function 
   | JsonValue.Boolean _ -> fun data -> 
       data |> Seq.map (function JsonValue.Boolean b -> b | _ -> failwith "Expected boolean") |> rengine.CreateLogicalVector :> SymbolicExpression
@@ -51,37 +85,48 @@ let getConvertor (rengine:REngine) = function
       data |> Seq.map (function JsonValue.String s -> s | _ -> failwith "Expected tring") |> rengine.CreateCharacterVector :> _ 
   | _ -> failwith "Unexpected json value"
 
-let evaluate frames code (rengine:REngine) = 
+let evaluate hash frames code (rengine:REngine) = 
 
   let mainEnv = rengine.Evaluate("new.env()").AsEnvironment()
   let tmpEnv = rengine.Evaluate("new.env()").AsEnvironment()
   rengine.SetSymbol("tmpEnv", tmpEnv)
   rengine.SetSymbol("mainEnv", mainEnv)
 
+  let knownFrames = set [ for name, _ in frames -> name ]
   for name, data in frames do
-    let props = 
-      match Array.head data with 
-      | JsonValue.Record props -> props |> Array.map (fun (k, v) -> 
-          k, getConvertor rengine v )
-      | _ -> failwith "Expected record"
-    let cols = props |> Seq.map (fun (p, _) -> p, ResizeArray<_>()) |> dict
-    for row in data do
-      match row with 
-      | JsonValue.Record recd -> for k, v in recd do cols.[k].Add(v)
-      | _ -> failwith "Expected record"
-    props |> Seq.iteri (fun i (n, conv) ->
-      rengine.SetSymbol("tmp" + string i, conv cols.[n], tmpEnv))  
-    let assigns = props |> Seq.mapi (fun i (n, _) -> sprintf "'%s'=tmpEnv$tmp%d" n i)
-    let df = rengine.Evaluate(sprintf "data.frame(%s)" (String.concat "," assigns)).AsDataFrame()
-    df.SetAttribute("names", rengine.CreateCharacterVector (Array.map fst props))
+    let df = 
+      match data with 
+      | Cached expr ->
+          rengine.Evaluate(expr).AsDataFrame()
+      | Downloaded data ->
+          let data = data.AsArray()
+          let props = 
+            match Array.head data with 
+            | JsonValue.Record props -> props |> Array.map (fun (k, v) -> 
+                k, getConvertor rengine v )
+            | _ -> failwith "Expected record"
+          let cols = props |> Seq.map (fun (p, _) -> p, ResizeArray<_>()) |> dict
+          for row in data do
+            match row with 
+            | JsonValue.Record recd -> for k, v in recd do cols.[k].Add(v)
+            | _ -> failwith "Expected record"
+          props |> Seq.iteri (fun i (n, conv) ->
+            rengine.SetSymbol("tmp" + string i, conv cols.[n], tmpEnv))  
+          let assigns = props |> Seq.mapi (fun i (n, _) -> sprintf "'%s'=tmpEnv$tmp%d" n i)
+          let df = rengine.Evaluate(sprintf "data.frame(%s)" (String.concat "," assigns)).AsDataFrame()
+          df.SetAttribute("names", rengine.CreateCharacterVector (Array.map fst props))
+          df
     rengine.SetSymbol(name, df, mainEnv)
 
   let code = sprintf "with(mainEnv, { %s })" code
   rengine.Evaluate(code) |> ignore
   [ for var in rengine.Evaluate("ls(mainEnv)").AsCharacter() do
-      match rengine.Evaluate("as.data.frame(mainEnv$" + var + ")") with
-      | ActivePatterns.DataFrame df -> yield var, df
-      | _ -> () ] 
+      if not (knownFrames.Contains(var)) then
+        match rengine.Evaluate("as.data.frame(mainEnv$" + var + ")") with
+        | ActivePatterns.DataFrame df -> 
+            rengine.Evaluate(sprintf "dataStore$`%s/%s/%s` <- mainEnv$%s" dataStoreUrl hash var var) |> ignore
+            yield var, df
+        | _ -> () ] 
 
 let formatValue (value:obj) = 
   match value with 
@@ -96,35 +141,24 @@ let formatType typ =
   elif typ = typeof<System.String> then "string"
   else failwithf "Unsupported type: %s" (typ.FullName)
 
-let getExports frames code rengine = 
-  [ for var, df in evaluate frames code rengine ->      
+let evaluateAndParse hash frames code rengine = 
+  let results = evaluate hash frames code rengine
+  [ for var, df in results ->
+      let data = 
+        [| for row in df.GetRows() ->
+             df.ColumnNames |> Array.map (fun c -> c, formatValue row.[c]) |> JsonValue.Record |] 
+        |> JsonValue.Array
       let row = df.GetRows() |> Seq.tryHead
       let tys = 
         match row with
         | Some row -> df.ColumnNames |> Array.map (fun c -> c, formatType(row.[c].GetType()))
         | None -> df.ColumnNames |> Array.map (fun c -> c, "object")
-      var, List.ofArray tys ]
+      var, tys, data.ToString() ]
 
-let getResults frames code rengine =
-  [ for var, df in evaluate frames code rengine ->      
-      var, 
-      [| for row in df.GetRows() ->
-           df.ColumnNames |> Array.map (fun c -> c, row.[c]) |] ]
-
-(*
-Async.RunSynchronously <| withREngine (fun rengine ->
-  let q = rengine.Evaluate("q <- quote({ print('hi')\ndata <- iris\nagg <- aggregate(Petal.Width~Species, data, mean)\ncolnames(agg)[2] <- \"PetalWidth\" })")
-  let count = rengine.Evaluate("length(q)").AsNumeric().[0] |> int
-  for i in 2 .. count do
-    let call = rengine.Evaluate(sprintf "as.list(q[%d][[1]])" i).AsCharacter()
-    if call.Length > 0 && call.[0] = "`<-`" then
-      if rengine.Evaluate(sprintf "!is.call(as.list(q[%d][[1]])[[2]])" i).AsCharacter().[0] = "TRUE" then
-        rengine.Evaluate(sprintf "as.character(as.list(q[%d][[1]])[[2]])" i).AsCharacter().[0]
-        |> printfn "%s"  )
-*)
-
-//Async.RunSynchronously <| withREngine (getExports "data <- iris\nagg <- aggregate(Petal.Width~Species, data, mean)")
-//Async.RunSynchronously <| withREngine (getResults "data <- iris\nagg <- aggregate(Petal.Width~Species, data, mean)")
+let evaluateAndStore hash frames code = async {
+  let! results = withREngine (evaluateAndParse hash frames code)
+  for var, _, data in results do do! storeDataset hash var data 
+  return [ for var, typ, _ in results -> var, typ ] }
 
 // --------------------------------------------------------------------------------------
 // Server that exposes the R functionality
@@ -136,11 +170,11 @@ type ExportsJson = JsonProvider<"""[
 
 type EvalJson = JsonProvider<"""[
   { "name":"foo",
-    "data":[] } ]""">
+    "url":"http://datastore/123" } ]""">
 
 type RequestJson = JsonProvider<"""{ 
-  "code":"a <- b",
-  "frames": [{"name":"b", "data":[]}, {"name":"c", "data":[]}] }""">
+  "code":"a <- b", "hash":"0x123456",
+  "frames": [{"name":"b", "url":"http://datastore/123"}, {"name":"c", "url":"http://datastore/123"}] }""">
 
 let app =
   setHeader  "Access-Control-Allow-Origin" "*"
@@ -152,27 +186,29 @@ let app =
     GET >=> path "/" >=>  
       Successful.OK "Service is running..."
 
-    POST >=> path "/eval" >=>       
-      request (fun req ctx -> async {
-        let req = RequestJson.Parse(System.Text.UTF32Encoding.UTF8.GetString(req.rawForm))
-        let! res = withREngine (getResults [| for f in req.Frames -> f.Name, [| for d in f.Data -> d.JsonValue |] |] req.Code)
-        let res = 
-          [| for var, data in res -> 
-              let data = Array.map (Array.map (fun (k, v) -> k, formatValue v) >> JsonValue.Record) data
-              EvalJson.Root(var, data).JsonValue |]
-          |> JsonValue.Array
-        return! Successful.OK (res.ToString()) ctx })
+    POST >=> path "/eval" >=> fun ctx -> async {
+      let req = RequestJson.Parse(System.Text.UTF32Encoding.UTF8.GetString(ctx.request.rawForm))
+      logf "Evaluating code (%s) with frames: %A" req.Hash [ for f in req.Frames -> f.Name]
+      let! frames = retrieveFrames [ for f in req.Frames -> f.Name, f.Url ]
+      let! rdata = evaluateAndStore req.Hash frames req.Code
+      let res = 
+        [| for var, _ in rdata -> EvalJson.Root(var, sprintf "%s/%s/%s" dataStoreUrl req.Hash var).JsonValue |]
+        |> JsonValue.Array
+      logf "Evaluated code (%s): %A" req.Hash [ for var, _ in rdata -> sprintf "%s/%s" req.Hash var ]
+      return! Successful.OK (res.ToString()) ctx }
 
-    POST >=> path "/exports" >=> 
-      request (fun req ctx -> async {
-        let req = RequestJson.Parse(System.Text.UTF32Encoding.UTF8.GetString(req.rawForm))
-        let! exp = withREngine (getExports [| for f in req.Frames -> f.Name, [| for d in f.Data -> d.JsonValue |] |] req.Code)
-        let res = 
-          [| for var, cols in exp -> 
-              let cols = [| for k, v in cols -> [|k; v|] |]
-              ExportsJson.Root(var, ExportsJson.Type("frame", cols)).JsonValue |]
-          |> JsonValue.Array
-        return! Successful.OK (res.ToString()) ctx }) ]
+    POST >=> path "/exports" >=> fun ctx -> async {
+      let req = RequestJson.Parse(System.Text.UTF32Encoding.UTF8.GetString(ctx.request.rawForm))
+      logf "Getting exports (%s) with frames: %A" req.Hash [ for f in req.Frames -> f.Name]
+      let! frames = retrieveFrames [ for f in req.Frames -> f.Name, f.Url ]
+      let! rdata = evaluateAndStore req.Hash frames req.Code
+      let res = 
+        [| for var, typ in rdata -> 
+            let cols = [| for k, v in typ -> [|k; v|] |]
+            ExportsJson.Root(var, ExportsJson.Type("frame", cols)).JsonValue |]
+        |> JsonValue.Array
+      logf "Got exports (%s): %A" req.Hash [ for var, _ in rdata -> var ] 
+      return! Successful.OK (res.ToString()) ctx } ]
 
 // --------------------------------------------------------------------------------------
 // Startup code for Azure hosting
