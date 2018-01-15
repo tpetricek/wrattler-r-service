@@ -27,15 +27,21 @@ let logf fmt = Printf.kprintf (fun s -> logger.info(Message.eventX s)) fmt
 
 let queue = new System.Collections.Concurrent.BlockingCollection<_>()
 let worker = System.Threading.Thread(fun () -> 
-  let rpath = __SOURCE_DIRECTORY__ + "/../rinstall/R-3.4.1" |> IO.Path.GetFullPath
+  //let rpath = __SOURCE_DIRECTORY__ + "/../rinstall/R-3.4.1" |> IO.Path.GetFullPath
+  let rpath = @"C:\Programs\Academic\R\R-3.4.2"
   let path = System.Environment.GetEnvironmentVariable("PATH")
   System.Environment.SetEnvironmentVariable("PATH", sprintf "%s;%s/bin/x64" path rpath)
   System.Environment.SetEnvironmentVariable("R_HOME", rpath)
   let rengine = REngine.GetInstance(rpath + "/bin/x64/R.dll", AutoPrint=false)
+  rengine.Evaluate(".libPaths( c( .libPaths(), \"C:\\\\Users\\\\tomas\\\\Documents\\\\R\\\\win-library\\\\3.4\") )") |> ignore
+
   rengine.Evaluate("dataStore <- list()") |> ignore
+  try rengine.Evaluate("library(tidyverse)") |> ignore
+  with e -> printfn "Tidyverse failed: %A" e
   while true do 
     let op = queue.Take() 
-    op rengine )
+    try op rengine 
+    with e -> printf "Operation failed: %A" e)
 worker.Start()
 
 let withREngine op = 
@@ -46,33 +52,6 @@ let withREngine op =
     )
   )
 
-// ------------------------------------------------------------------------------------------------
-// Calling data store and caching data
-// ------------------------------------------------------------------------------------------------
-
-let storeDataset hash file json = 
-  Http.AsyncRequestString
-    ( sprintf "%s/%s/%s" dataStoreUrl hash file, 
-      httpMethod="PUT", body = HttpRequestBody.TextRequest json)
-  |> Async.Ignore
-
-type RetrievedFrame = 
-  | Cached of string
-  | Downloaded of JsonValue
-
-let retrieveFrames frames = async {
-  let! known = withREngine(fun rengine ->
-    set (rengine.Evaluate("ls(dataStore)").AsCharacter()))
-  let res = ResizeArray<_>()
-  for var, url in frames do
-    if known.Contains url then res.Add(var, Cached(sprintf "dataStore$`%s`" url)) else
-    let! json = Http.AsyncRequestString(url, httpMethod="GET")
-    res.Add(var, Downloaded(JsonValue.Parse(json))) 
-  return res :> seq<_> }
-
-// ------------------------------------------------------------------------------------------------
-// Calling data store
-// ------------------------------------------------------------------------------------------------
 
 let getConvertor (rengine:REngine) = function 
   | JsonValue.Boolean _ -> fun data -> 
@@ -85,6 +64,57 @@ let getConvertor (rengine:REngine) = function
       data |> Seq.map (function JsonValue.String s -> s | _ -> failwith "Expected tring") |> rengine.CreateCharacterVector :> _ 
   | _ -> failwith "Unexpected json value"
 
+let createRDataFrame (rengine:REngine) data = 
+  let tmpEnv = rengine.Evaluate("new.env()").AsEnvironment()
+  rengine.SetSymbol("tmpEnv", tmpEnv)
+  let props = 
+    match Array.head data with 
+    | JsonValue.Record props -> props |> Array.map (fun (k, v) -> 
+        k, getConvertor rengine v )
+    | _ -> failwith "Expected record"
+  let cols = props |> Seq.map (fun (p, _) -> p, ResizeArray<_>()) |> dict
+  for row in data do
+    match row with 
+    | JsonValue.Record recd -> for k, v in recd do cols.[k].Add(v)
+    | _ -> failwith "Expected record"
+  props |> Seq.iteri (fun i (n, conv) ->
+    rengine.SetSymbol("tmp" + string i, conv cols.[n], tmpEnv))  
+  let assigns = props |> Seq.mapi (fun i (n, _) -> sprintf "'%s'=tmpEnv$tmp%d" n i)
+  rengine.Evaluate(sprintf "tmpEnv$df <- data.frame(%s)" (String.concat "," assigns)) |> ignore
+  rengine.Evaluate(sprintf "colnames(tmpEnv$df) <- c(%s)" (String.concat "," [ for n, _ in props -> "\"" + n + "\"" ])) |> ignore
+  "tmpEnv$df"
+
+// ------------------------------------------------------------------------------------------------
+// Calling data store and caching data
+// ------------------------------------------------------------------------------------------------
+
+let storeDataset hash file json = 
+  logf "Uploading data set: %s/%s" hash file
+  Http.AsyncRequestString
+    ( sprintf "%s/%s/%s" dataStoreUrl hash file, 
+      httpMethod="PUT", body = HttpRequestBody.TextRequest json)
+  |> Async.Ignore
+
+let retrieveFrames frames = async {
+  let! known = withREngine(fun rengine ->
+    set (rengine.Evaluate("ls(dataStore)").AsCharacter()))
+  let res = ResizeArray<_>()
+  for var, url in frames do
+    if known.Contains url then res.Add(var, sprintf "dataStore$`%s`" url) else
+    logf "Downloading data set: %s" url
+    let! json = Http.AsyncRequestString(url, httpMethod="GET")
+
+    let data = JsonValue.Parse(json).AsArray()
+    do! withREngine (fun rengine ->
+      let expr = createRDataFrame rengine data
+      rengine.Evaluate(sprintf "dataStore$`%s` <- %s" url expr) |> ignore )
+    res.Add(var, sprintf "dataStore$`%s`" url) 
+  return res :> seq<_> }
+
+// ------------------------------------------------------------------------------------------------
+// Calling data store
+// ------------------------------------------------------------------------------------------------
+
 let evaluate hash frames code (rengine:REngine) = 
 
   let mainEnv = rengine.Evaluate("new.env()").AsEnvironment()
@@ -93,40 +123,24 @@ let evaluate hash frames code (rengine:REngine) =
   rengine.SetSymbol("mainEnv", mainEnv)
 
   let knownFrames = set [ for name, _ in frames -> name ]
-  for name, data in frames do
-    let df = 
-      match data with 
-      | Cached expr ->
-          rengine.Evaluate(expr).AsDataFrame()
-      | Downloaded data ->
-          let data = data.AsArray()
-          let props = 
-            match Array.head data with 
-            | JsonValue.Record props -> props |> Array.map (fun (k, v) -> 
-                k, getConvertor rengine v )
-            | _ -> failwith "Expected record"
-          let cols = props |> Seq.map (fun (p, _) -> p, ResizeArray<_>()) |> dict
-          for row in data do
-            match row with 
-            | JsonValue.Record recd -> for k, v in recd do cols.[k].Add(v)
-            | _ -> failwith "Expected record"
-          props |> Seq.iteri (fun i (n, conv) ->
-            rengine.SetSymbol("tmp" + string i, conv cols.[n], tmpEnv))  
-          let assigns = props |> Seq.mapi (fun i (n, _) -> sprintf "'%s'=tmpEnv$tmp%d" n i)
-          let df = rengine.Evaluate(sprintf "data.frame(%s)" (String.concat "," assigns)).AsDataFrame()
-          df.SetAttribute("names", rengine.CreateCharacterVector (Array.map fst props))
-          df
-    rengine.SetSymbol(name, df, mainEnv)
+  for name, expr in frames do
+    let df = rengine.Evaluate(expr:string).AsDataFrame()
+    rengine.SetSymbol(name, df)
 
+//  rengine.Evaluate(code)
+  //rengine.Evaluate("1+2")
   let code = sprintf "with(mainEnv, { %s })" code
   rengine.Evaluate(code) |> ignore
-  [ for var in rengine.Evaluate("ls(mainEnv)").AsCharacter() do
+  [ for var in rengine.Evaluate("ls(mainEnv)").AsCharacter() ->
       if not (knownFrames.Contains(var)) then
-        match rengine.Evaluate("as.data.frame(mainEnv$" + var + ")") with
-        | ActivePatterns.DataFrame df -> 
-            rengine.Evaluate(sprintf "dataStore$`%s/%s/%s` <- mainEnv$%s" dataStoreUrl hash var var) |> ignore
-            yield var, df
-        | _ -> () ] 
+        try
+          match rengine.Evaluate("as.data.frame(mainEnv$" + var + ")") with
+          | ActivePatterns.DataFrame df -> 
+              rengine.Evaluate(sprintf "dataStore$`%s/%s/%s` <- mainEnv$%s" dataStoreUrl hash var var) |> ignore
+              [ var, df ]
+          | _ -> []
+        with _ -> [] (* not a data frame *) 
+      else [] ] |> List.concat
 
 let formatValue (value:obj) = 
   match value with 
@@ -141,19 +155,36 @@ let formatType typ =
   elif typ = typeof<System.String> then "string"
   else failwithf "Unsupported type: %s" (typ.FullName)
 
+(*
+let code = """
+training <- 
+  bb2014 %>%
+  mutate(`Urban/rural` = ifelse(`Urban/rural`=="Urban", 1, 0)) 
+test <- bb2015fix %>%
+  mutate(`Urban/rural` = ifelse(`Urban/rural`=="Urban", 1, 0))
+
+# glm(`Urban/rural`~., family=binomial(link='logit'), data=training)
+"""
+*)
 let evaluateAndParse hash frames code rengine = 
-  let results = evaluate hash frames code rengine
-  [ for var, df in results ->
-      let data = 
-        [| for row in df.GetRows() ->
-             df.ColumnNames |> Array.map (fun c -> c, formatValue row.[c]) |> JsonValue.Record |] 
-        |> JsonValue.Array
-      let row = df.GetRows() |> Seq.tryHead
-      let tys = 
-        match row with
-        | Some row -> df.ColumnNames |> Array.map (fun c -> c, formatType(row.[c].GetType()))
-        | None -> df.ColumnNames |> Array.map (fun c -> c, "object")
-      var, tys, data.ToString() ]
+  try
+    logf "Evaluating: %s" code
+    let results = evaluate hash frames code rengine
+    logf "Success. Results: %A" results
+    [ for var, df in results ->
+        let data = 
+          [| for row in df.GetRows() ->
+               df.ColumnNames |> Array.map (fun c -> c, formatValue row.[c]) |> JsonValue.Record |] 
+          |> JsonValue.Array
+        let row = df.GetRows() |> Seq.tryHead
+        let tys = 
+          match row with
+          | Some row -> df.ColumnNames |> Array.map (fun c -> c, formatType(row.[c].GetType()))
+          | None -> df.ColumnNames |> Array.map (fun c -> c, "object")
+        var, tys, data.ToString() ]
+  with e ->
+    logf "Failed to evluate! %A" e
+    reraise ()
 
 let evaluateAndStore hash frames code = async {
   let! results = withREngine (evaluateAndParse hash frames code)
@@ -201,7 +232,16 @@ let app =
       let req = RequestJson.Parse(System.Text.UTF32Encoding.UTF8.GetString(ctx.request.rawForm))
       logf "Getting exports (%s) with frames: %A" req.Hash [ for f in req.Frames -> f.Name]
       let! frames = retrieveFrames [ for f in req.Frames -> f.Name, f.Url ]
+(*
+      let frames = 
+        retrieveFrames [
+          "bb2014", "http://localhost:7102/434925e5/it"
+          "bb2015", "http://localhost:7102/699b2df0/it"
+          "bb2015fix", "http://localhost:7102/1089b936/it" ] |> Async.RunSynchronously
+*)
+      logf "Downloaded frames"
       let! rdata = evaluateAndStore req.Hash frames req.Code
+      logf "Evaluated results"
       let res = 
         [| for var, typ in rdata -> 
             let cols = [| for k, v in typ -> [|k; v|] |]
