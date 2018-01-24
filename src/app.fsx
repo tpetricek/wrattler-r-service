@@ -52,33 +52,65 @@ let withREngine op =
     )
   )
 
+#load "pivot.fs"
+open TheGamma.Services.Pivot
 
-let getConvertor (rengine:REngine) = function 
-  | JsonValue.Boolean _ -> fun data -> 
-      data |> Seq.map (function JsonValue.Boolean b -> b | _ -> failwith "Expected boolean") |> rengine.CreateLogicalVector :> SymbolicExpression
-  | JsonValue.Number _ -> fun data -> 
-      data |> Seq.map (function JsonValue.Number n -> float n | JsonValue.Float n -> n | _ -> failwith "Expected number") |> rengine.CreateNumericVector :> _ 
-  | JsonValue.Float _ -> fun data -> 
-      data |> Seq.map (function JsonValue.Number n -> float n | JsonValue.Float n -> n | _ -> failwith "Expected number") |> rengine.CreateNumericVector :> _ 
-  | JsonValue.String _ -> fun data -> 
-      data |> Seq.map (function JsonValue.String s -> s | _ -> failwith "Expected tring") |> rengine.CreateCharacterVector :> _ 
-  | _ -> failwith "Unexpected json value"
+let getConvertor (rengine:REngine) typ =
+  let stringConvertor data =
+    data |> Array.map (function 
+      | JsonValue.String s -> s 
+      | v -> v.ToString() ) |> rengine.CreateCharacterVector :> SymbolicExpression
+  let withFallback f data : SymbolicExpression =
+    try f data with _ -> stringConvertor data 
+  match typ with 
+  | InferredType.OneZero _ 
+  | InferredType.Bool _ -> withFallback (fun data -> 
+      data |> Array.map (function 
+        | JsonValue.Boolean b -> b 
+        | JsonValue.Number 1.0M -> true
+        | JsonValue.Number 0.0M -> false
+        | v -> failwithf "Expected boolean, but got: %A" v) |> rengine.CreateLogicalVector :> _)
+  | InferredType.Int _ 
+  | InferredType.Float _ -> withFallback (fun data -> 
+      let line = data |> Array.map (function 
+        | JsonValue.Number n -> string (float n)
+        | JsonValue.Float n -> string n 
+        | JsonValue.String "" -> "NA"
+        | JsonValue.String s -> string (float s)
+        | v -> failwithf "Expected number, but got: %A" v) |> String.concat "," |> sprintf "c(%s)" 
+      rengine.Evaluate(line).AsNumeric() :> _)
+  | InferredType.Date _
+  | InferredType.Any
+  | InferredType.Empty
+  | InferredType.String _ -> stringConvertor 
 
 let createRDataFrame (rengine:REngine) data = 
   let tmpEnv = rengine.Evaluate("new.env()").AsEnvironment()
   rengine.SetSymbol("tmpEnv", tmpEnv)
-  let props = 
-    match Array.head data with 
-    | JsonValue.Record props -> props |> Array.map (fun (k, v) -> 
-        k, getConvertor rengine v )
-    | _ -> failwith "Expected record"
+
+  let propNames = (Seq.head data:JsonValue).Properties() |> Seq.map fst
+  let propConvs = 
+    data
+    |> Seq.truncate 500
+    |> Seq.map (fun (r:JsonValue) -> 
+        r.Properties() |> Array.map (function
+          | _, JsonValue.Boolean b -> b.ToString()
+          | _, JsonValue.Number n -> n.ToString()
+          | _, JsonValue.Float f -> f.ToString()
+          | _, JsonValue.String s -> s.ToString()
+          | _ -> failwith "createRDataFrame: Unexpected value" ) )
+    |> Seq.map (Array.map Inference.inferType)
+    |> Seq.reduce (Array.map2 Inference.unifyTypes)
+    |> Seq.map (getConvertor rengine)
+
+  let props = Seq.zip propNames propConvs
   let cols = props |> Seq.map (fun (p, _) -> p, ResizeArray<_>()) |> dict
   for row in data do
     match row with 
     | JsonValue.Record recd -> for k, v in recd do cols.[k].Add(v)
     | _ -> failwith "Expected record"
   props |> Seq.iteri (fun i (n, conv) ->
-    rengine.SetSymbol("tmp" + string i, conv cols.[n], tmpEnv))  
+    rengine.SetSymbol("tmp" + string i, conv (cols.[n].ToArray()), tmpEnv))  
   let assigns = props |> Seq.mapi (fun i (n, _) -> sprintf "'%s'=tmpEnv$tmp%d" n i)
   rengine.Evaluate(sprintf "tmpEnv$df <- data.frame(%s)" (String.concat "," assigns)) |> ignore
   rengine.Evaluate(sprintf "colnames(tmpEnv$df) <- c(%s)" (String.concat "," [ for n, _ in props -> "\"" + n + "\"" ])) |> ignore
@@ -145,6 +177,7 @@ let evaluate hash frames code (rengine:REngine) =
 let formatValue (value:obj) = 
   match value with 
   | :? int as n -> JsonValue.Number(decimal n)
+  | :? float as f when Double.IsNaN f -> JsonValue.String("")
   | :? float as f -> JsonValue.Float(f)
   | :? string as s -> JsonValue.String(s)
   | _ -> failwithf "Unsupported value: %A" value

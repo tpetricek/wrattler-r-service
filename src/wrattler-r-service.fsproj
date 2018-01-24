@@ -60,6 +60,7 @@
   -->
   <ItemGroup>
     <None Include="paket.references" />
+    <Compile Include="pivot.fs" />
     <Compile Include="app.fsx" />
   </ItemGroup>
   <ItemGroup>
