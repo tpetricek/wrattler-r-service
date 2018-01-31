@@ -25,6 +25,10 @@ let logf fmt = Printf.kprintf (fun s -> logger.info(Message.eventX s)) fmt
 // Thread-safe R engine access
 // ------------------------------------------------------------------------------------------------
 
+type RContext = 
+  { REngine : REngine
+    KnownNames : Set<string> }
+
 let queue = new System.Collections.Concurrent.BlockingCollection<_>()
 let worker = System.Threading.Thread(fun () -> 
   //let rpath = __SOURCE_DIRECTORY__ + "/../rinstall/R-3.4.1" |> IO.Path.GetFullPath
@@ -35,22 +39,51 @@ let worker = System.Threading.Thread(fun () ->
   let rengine = REngine.GetInstance(rpath + "/bin/x64/R.dll", AutoPrint=false)
   rengine.Evaluate(".libPaths( c( .libPaths(), \"C:\\\\Users\\\\tomas\\\\Documents\\\\R\\\\win-library\\\\3.4\") )") |> ignore
 
+  rengine.Evaluate("""
+    showTree <- function(e, write = cat) {
+      w <- makeCodeWalker(call = showTreeCall, leaf = showTreeLeaf,
+                          write = write, res = new.env())
+      walkCode(e, w)
+      w$res
+    }
+    showTreeCall <- function(e, w0) {
+      for (a in as.list(e)) {
+        w <- makeCodeWalker(call = w0$call, leaf = w0$leaf, write = w0$write, res = new.env())
+        walkCode(a, w)
+        assign(toString(length(w0$res)+1), w$res, envir=w0$res)
+      }
+    }
+    showTreeLeaf <- function(e, w) {
+      if (typeof(e) == "symbol") w$res$it <- e
+      else w$res$it <- deparse(e)
+    }  
+  """) |> ignore
   rengine.Evaluate("dataStore <- list()") |> ignore
-  try rengine.Evaluate("library(tidyverse)") |> ignore
-  with e -> printfn "Tidyverse failed: %A" e
+  try 
+    rengine.Evaluate("library(tidyverse)") |> ignore
+    rengine.Evaluate("library(codetools)") |> ignore
+  with e -> printfn "Packages failed: %A" e
+
+  let knownNames = 
+    rengine.Evaluate("search()").AsCharacter() 
+    |> Seq.collect (fun pkg -> rengine.Evaluate(sprintf "ls(\"%s\")" pkg).AsCharacter()) 
+    |> set
+  let ctx = { REngine = rengine; KnownNames = knownNames }
   while true do 
     let op = queue.Take() 
-    try op rengine 
+    try op ctx
     with e -> printf "Operation failed: %A" e)
 worker.Start()
 
-let withREngine op = 
+let withRContext op = 
   Async.FromContinuations(fun (cont, econt, _) ->
     queue.Add(fun reng -> 
        let res = try Choice1Of2(op reng) with e -> Choice2Of2(e)
        match res with Choice1Of2 res -> cont res | Choice2Of2 e -> econt e    
     )
   )
+
+let withREngine op = withRContext (fun ctx -> op ctx.REngine)
 
 #load "pivot.fs"
 open TheGamma.Services.Pivot
@@ -224,6 +257,67 @@ let evaluateAndStore hash frames code = async {
   for var, _, data in results do do! storeDataset hash var data 
   return [ for var, typ, _ in results -> var, typ ] }
 
+let source = """
+colnames(bb2014) <- c("Urban","Down","Up","Latency","Web")
+colnames(bb2015fix) <- c("Urban","Down","Up","Latency","Web")
+
+training <- 
+  bb2014 %>% mutate(Urban = ifelse(Urban=="Urban", 1, 0))
+
+test <- 
+  bb2015fix %>% mutate(Urban = ifelse(Urban=="Urban", 1, 0)) 
+
+model <- glm(Urban ~.,family=binomial(link='logit'),data=training)
+pred <- predict(model, test, type="response") %>% round
+pred[is.na(pred)] <- 0.5
+
+predicted <- data.frame(Urban=pred, ActualUrban=test$Urban)"""
+
+type RLeaf = 
+  | Symbol of string
+  | Value of obj list
+  | Expr of SymbolicExpression
+
+type RTree = 
+  | Leaf of RLeaf
+  | Node of RTree list
+
+let rec parseRTree (tree:SymbolicExpression) = 
+  if tree.Type = Internals.SymbolicExpressionType.Environment then
+    let env = tree.AsEnvironment()
+    let symbols = env.GetSymbolNames() |> List.ofSeq
+    if symbols = ["it"] then
+      let it = env.GetSymbol("it")
+      match it.Type with
+      | Internals.SymbolicExpressionType.Symbol -> Leaf(Symbol(it.AsSymbol().PrintName))
+      | Internals.SymbolicExpressionType.CharacterVector -> Leaf(Value [ for c in it.AsCharacter() -> box c])
+      | _ -> 
+          printfn "******* %A" it.Type
+          Leaf(Expr(it))
+    else
+      let count = symbols |> Seq.map int |> Seq.max
+      Node [ for i in 1 .. count -> parseRTree (env.GetSymbol(string i))  ]
+  else
+    failwithf "Expected environment but got: %A" tree.Type
+
+let collect f tree = 
+  let rec loop tree = seq {
+    yield! f tree 
+    match tree with 
+    | Node children -> for c in children do yield! loop c
+    | _ -> () }
+  loop tree |> List.ofSeq
+  
+let getBindings source = withRContext (fun { REngine = rengine; KnownNames = knownNames } ->
+  let tree = rengine.Evaluate("showTree(quote({ " + source + " }))") |> parseRTree
+  let exports = tree |> collect (function
+    | Node [ Leaf(Symbol("<-")); Leaf(Symbol sym); _ ] -> [sym]
+    | _ -> []) 
+  let imports = tree |> collect (function
+    | Leaf(Symbol name) when not(knownNames.Contains(name)) -> [name]
+    | _ -> [])    
+  imports, exports )
+
 // --------------------------------------------------------------------------------------
 // Server that exposes the R functionality
 // --------------------------------------------------------------------------------------
@@ -265,13 +359,6 @@ let app =
       let req = RequestJson.Parse(System.Text.UTF32Encoding.UTF8.GetString(ctx.request.rawForm))
       logf "Getting exports (%s) with frames: %A" req.Hash [ for f in req.Frames -> f.Name]
       let! frames = retrieveFrames [ for f in req.Frames -> f.Name, f.Url ]
-(*
-      let frames = 
-        retrieveFrames [
-          "bb2014", "http://localhost:7102/434925e5/it"
-          "bb2015", "http://localhost:7102/699b2df0/it"
-          "bb2015fix", "http://localhost:7102/1089b936/it" ] |> Async.RunSynchronously
-*)
       logf "Downloaded frames"
       let! rdata = evaluateAndStore req.Hash frames req.Code
       logf "Evaluated results"
