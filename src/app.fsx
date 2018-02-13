@@ -236,7 +236,7 @@ let evaluateAndParse hash frames code rengine =
   try
     logf "Evaluating: %s" code
     let results = evaluate hash frames code rengine
-    logf "Success. Results: %A" results
+    logf "Success. Results (%s): %A" (String.concat "," (List.map fst results)) results
     [ for var, df in results ->
         let data = 
           [| for row in df.GetRows() ->
@@ -308,31 +308,38 @@ let collect f tree =
     | _ -> () }
   loop tree |> List.ofSeq
   
-let getBindings source = withRContext (fun { REngine = rengine; KnownNames = knownNames } ->
+let getBindings availableFrames source = withRContext (fun { REngine = rengine; KnownNames = knownNames } ->
+  let availableFrames = set availableFrames
   let tree = rengine.Evaluate("showTree(quote({ " + source + " }))") |> parseRTree
   let exports = tree |> collect (function
     | Node [ Leaf(Symbol("<-")); Leaf(Symbol sym); _ ] -> [sym]
     | _ -> []) 
   let imports = tree |> collect (function
-    | Leaf(Symbol name) when not(knownNames.Contains(name)) -> [name]
+    | Leaf(Symbol name) when availableFrames.Contains(name)   
+        // && not(knownNames.Contains(name))  -- running code adds names to this, which breaks things
+          -> [name]
     | _ -> [])    
-  imports, exports )
+  List.distinct imports, List.distinct exports )
 
 // --------------------------------------------------------------------------------------
 // Server that exposes the R functionality
 // --------------------------------------------------------------------------------------
 
-type ExportsJson = JsonProvider<"""[
-  { "variable":"foo",
-    "type":{"kind":"frame", "columns":[["foo", "string"],["bar", "int"]]}} ]""">
+type ExportsResponseJson = JsonProvider<"""
+  { "exports": ["foo","bar"],
+    "imports": ["foo","bar"] }""">
 
-type EvalJson = JsonProvider<"""[
+type EvalResponseJson = JsonProvider<"""[
   { "name":"foo",
     "url":"http://datastore/123" } ]""">
 
-type RequestJson = JsonProvider<"""{ 
+type EvalRequestJson = JsonProvider<"""{ 
   "code":"a <- b", "hash":"0x123456",
   "frames": [{"name":"b", "url":"http://datastore/123"}, {"name":"c", "url":"http://datastore/123"}] }""">
+
+type ExportsRequestJson = JsonProvider<"""{ 
+  "code":"a <- b", "hash":"0x123456",
+  "frames": ["foo","bar"] }""">
 
 let app =
   setHeader  "Access-Control-Allow-Origin" "*"
@@ -345,29 +352,23 @@ let app =
       Successful.OK "Service is running..."
 
     POST >=> path "/eval" >=> fun ctx -> async {
-      let req = RequestJson.Parse(System.Text.UTF32Encoding.UTF8.GetString(ctx.request.rawForm))
+      let req = EvalRequestJson.Parse(System.Text.UTF32Encoding.UTF8.GetString(ctx.request.rawForm))
       logf "Evaluating code (%s) with frames: %A" req.Hash [ for f in req.Frames -> f.Name]
       let! frames = retrieveFrames [ for f in req.Frames -> f.Name, f.Url ]
       let! rdata = evaluateAndStore req.Hash frames req.Code
       let res = 
-        [| for var, _ in rdata -> EvalJson.Root(var, sprintf "%s/%s/%s" dataStoreUrl req.Hash var).JsonValue |]
+        [| for var, _ in rdata -> EvalResponseJson.Root(var, sprintf "%s/%s/%s" dataStoreUrl req.Hash var).JsonValue |]
         |> JsonValue.Array
       logf "Evaluated code (%s): %A" req.Hash [ for var, _ in rdata -> sprintf "%s/%s" req.Hash var ]
       return! Successful.OK (res.ToString()) ctx }
 
     POST >=> path "/exports" >=> fun ctx -> async {
-      let req = RequestJson.Parse(System.Text.UTF32Encoding.UTF8.GetString(ctx.request.rawForm))
-      logf "Getting exports (%s) with frames: %A" req.Hash [ for f in req.Frames -> f.Name]
-      let! frames = retrieveFrames [ for f in req.Frames -> f.Name, f.Url ]
-      logf "Downloaded frames"
-      let! rdata = evaluateAndStore req.Hash frames req.Code
-      logf "Evaluated results"
-      let res = 
-        [| for var, typ in rdata -> 
-            let cols = [| for k, v in typ -> [|k; v|] |]
-            ExportsJson.Root(var, ExportsJson.Type("frame", cols)).JsonValue |]
-        |> JsonValue.Array
-      logf "Got exports (%s): %A" req.Hash [ for var, _ in rdata -> var ] 
+      let req = ExportsRequestJson.Parse(System.Text.UTF32Encoding.UTF8.GetString(ctx.request.rawForm))
+      logf "Getting exports (%s) with frames: %A" req.Hash (List.ofSeq req.Frames)
+      let! imports, exports = getBindings req.Frames req.Code
+      logf "Got imports: %A" imports 
+      logf "Got exports: %A" exports
+      let res = ExportsResponseJson.Root(Array.ofSeq exports, Array.ofSeq imports) 
       return! Successful.OK (res.ToString()) ctx } ]
 
 // --------------------------------------------------------------------------------------
