@@ -31,13 +31,15 @@ type RContext =
 
 let queue = new System.Collections.Concurrent.BlockingCollection<_>()
 let worker = System.Threading.Thread(fun () -> 
-  //let rpath = __SOURCE_DIRECTORY__ + "/../rinstall/R-3.4.1" |> IO.Path.GetFullPath
-  let rpath = @"C:\Programs\Academic\R\R-3.4.2"
+  let rpath = __SOURCE_DIRECTORY__ + "/../rinstall/R-3.4.1" |> IO.Path.GetFullPath
+  let pkgpath = __SOURCE_DIRECTORY__ + "/../rinstall/libraries" |> IO.Path.GetFullPath
+  //let rpath = @"C:\Programs\Academic\R\R-3.4.2"
   let path = System.Environment.GetEnvironmentVariable("PATH")
   System.Environment.SetEnvironmentVariable("PATH", sprintf "%s;%s/bin/x64" path rpath)
   System.Environment.SetEnvironmentVariable("R_HOME", rpath)
   let rengine = REngine.GetInstance(rpath + "/bin/x64/R.dll", AutoPrint=false)
-  rengine.Evaluate(".libPaths( c( .libPaths(), \"C:\\\\Users\\\\tomas\\\\Documents\\\\R\\\\win-library\\\\3.4\") )") |> ignore
+  //rengine.Evaluate(".libPaths( c( .libPaths(), \"C:\\\\Users\\\\tomas\\\\Documents\\\\R\\\\win-library\\\\3.4\") )") |> ignore
+  rengine.Evaluate(sprintf ".libPaths( c( .libPaths(), \"%s\") )" (pkgpath.Replace("\\","\\\\"))) |> ignore
 
   rengine.Evaluate("""
     showTree <- function(e, write = cat) {
