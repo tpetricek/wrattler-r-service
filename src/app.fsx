@@ -17,7 +17,8 @@ open System
 open RDotNet
 open FSharp.Data
 
-let dataStoreUrl = "http://localhost:7102"
+//let dataStoreUrl = "http://localhost:7102"
+let dataStoreUrl = "http://wrattler-data-store.azurewebsites.net"
 let logger = Targets.create Verbose [||]
 let logf fmt = Printf.kprintf (fun s -> logger.info(Message.eventX s)) fmt
 
