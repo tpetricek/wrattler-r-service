@@ -34,23 +34,23 @@ Target "build" (fun _ ->
 // --------------------------------------------------------------------------------------
 
 Target "installr" (fun _ ->
-  if not (File.Exists("rinstall/R-3.4.1.zip")) then
-    use wc = new Net.WebClient()
-    CleanDir "rinstall"
-    CleanDir "rinstall/libraries"
-    wc.DownloadFile("https://wrattlerdata.blob.core.windows.net/install/R-3.4.1.zip", "rinstall/R-3.4.1.zip")
-    Unzip "rinstall" "rinstall/R-3.4.1.zip"
+  CleanDir "rinstall"
+  CleanDir "rinstall/libraries"
+  
+  use wc = new Net.WebClient()
+  wc.DownloadFile("https://wrattlerdata.blob.core.windows.net/install/R-3.4.1.zip", "rinstall/R-3.4.1.zip")
+  Unzip "rinstall" "rinstall/R-3.4.1.zip"
 
-    let packages = ["tidyverse"]
-    let lib = __SOURCE_DIRECTORY__ </> "rinstall/libraries"
-    for package in packages do 
-      printfn "Installing package: %s" package
-      let res = 
-        ExecProcessAndReturnMessages (fun p ->
-          p.FileName <- "rinstall/R-3.4.1/bin/R.exe"
-          p.Arguments <- sprintf "--vanilla -e install.packages('%s',lib='%s',repos='http://cran.us.r-project.org')" package (lib.Replace("\\","/"))
-        ) TimeSpan.MaxValue
-      for r in res.Messages do printfn ">>> %s" r
+  let packages = ["tidyverse"]
+  let lib = __SOURCE_DIRECTORY__ </> "rinstall/libraries"
+  for package in packages do 
+    printfn "Installing package: %s" package
+    let res = 
+      ExecProcessAndReturnMessages (fun p ->
+        p.FileName <- "rinstall/R-3.4.1/bin/R.exe"
+        p.Arguments <- sprintf "--vanilla -e install.packages('%s',lib='%s',repos='http://cran.us.r-project.org',dependencies=TRUE)" package (lib.Replace("\\","/"))
+      ) TimeSpan.MaxValue
+    for r in res.Messages do printfn ">>> %s" r
 )
 
 let newName prefix f = 
