@@ -51,6 +51,7 @@ Target "installr" (fun _ ->
           p.Arguments <- sprintf "--vanilla -e install.packages('%s',lib='%s',repos='http://cran.us.r-project.org',dependencies=TRUE)" package (lib.Replace("\\","/"))
         ) TimeSpan.MaxValue
       for r in res.Messages do printfn ">>> %s" r
+      for r in res.Errors do printfn "!!! %s" r
 )
 
 let newName prefix f = 
