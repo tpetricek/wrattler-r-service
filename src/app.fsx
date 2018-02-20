@@ -242,9 +242,12 @@ let evaluateAndParse hash frames code rengine =
     logf "Success. Results (%s): %A" (String.concat "," (List.map fst results)) results
     [ for var, df in results ->
         logf "Reading data for frame: %s" var
+        let rawRows = df.GetRows() |> Array.ofSeq
+        logf ".. got raw rows %d" rawRows.Length
         let data = 
-          [| for row in df.GetRows() ->
-               df.ColumnNames |> Array.map (fun c -> c, formatValue row.[c]) |> JsonValue.Record |] 
+          rawRows
+          |> Array.map (fun row ->
+               df.ColumnNames |> Array.map (fun c -> c, formatValue row.[c]) |> JsonValue.Record ) 
           |> JsonValue.Array
         logf ".. got data %d" (data.AsArray().Length)
         let row = df.GetRows() |> Seq.tryHead
