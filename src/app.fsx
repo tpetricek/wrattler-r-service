@@ -40,32 +40,38 @@ let worker = System.Threading.Thread(fun () ->
   System.Environment.SetEnvironmentVariable("R_HOME", rpath)
   let rengine = REngine.GetInstance(rpath + "/bin/x64/R.dll", AutoPrint=false)
   //rengine.Evaluate(".libPaths( c( .libPaths(), \"C:\\\\Users\\\\tomas\\\\Documents\\\\R\\\\win-library\\\\3.4\") )") |> ignore
-  rengine.Evaluate(sprintf ".libPaths( c( .libPaths(), \"%s\") )" (pkgpath.Replace("\\","\\\\"))) |> ignore
+  rengine.Evaluate(sprintf ".libPaths( c(\"%s\") )" (pkgpath.Replace("\\","\\\\"))) |> ignore
 
   try 
     rengine.Evaluate("library(tidyverse)") |> ignore
     rengine.Evaluate("library(codetools)") |> ignore
   with e -> printfn "Packages failed: %A" e
+
   rengine.Evaluate("""
-    showTree <- function(e, write = cat) {
-      w <- makeCodeWalker(call = showTreeCall, leaf = showTreeLeaf,
+    buildSyntaxTree <- function(e, write = cat) {
+      w <- makeCodeWalker(call = buildSyntaxTreeCall, leaf = buildSyntaxTreeLeaf,
                           write = write, res = new.env())
       walkCode(e, w)
       w$res
     }
-    showTreeCall <- function(e, w0) {
+    buildSyntaxTreeCall <- function(e, w0) {
       for (a in as.list(e)) {
         w <- makeCodeWalker(call = w0$call, leaf = w0$leaf, write = w0$write, res = new.env())
         walkCode(a, w)
         assign(toString(length(w0$res)+1), w$res, envir=w0$res)
       }
     }
-    showTreeLeaf <- function(e, w) {
+    buildSyntaxTreeLeaf <- function(e, w) {
       if (typeof(e) == "symbol") w$res$it <- e
       else w$res$it <- deparse(e)
     }  
   """) |> ignore
+  try 
+    rengine.Evaluate("buildSyntaxTree(quote({ 1 + 1 }))").AsEnvironment() |> ignore
+  with e ->
+    logf "Failed getting expression tree: %A" e
   rengine.Evaluate("dataStore <- list()") |> ignore
+
 
   let knownNames = 
     rengine.Evaluate("search()").AsCharacter() 
@@ -325,7 +331,7 @@ let collect f tree =
   
 let getBindings availableFrames source = withRContext (fun { REngine = rengine; KnownNames = knownNames } ->
   let availableFrames = set availableFrames
-  let tree = rengine.Evaluate("showTree(quote({ " + source + " }))") |> parseRTree
+  let tree = rengine.Evaluate("buildSyntaxTree(quote({ " + source + " }))") |> parseRTree
   let exports = tree |> collect (function
     | Node [ Leaf(Symbol("<-")); Leaf(Symbol sym); _ ] -> [sym]
     | _ -> []) 
