@@ -42,6 +42,10 @@ let worker = System.Threading.Thread(fun () ->
   //rengine.Evaluate(".libPaths( c( .libPaths(), \"C:\\\\Users\\\\tomas\\\\Documents\\\\R\\\\win-library\\\\3.4\") )") |> ignore
   rengine.Evaluate(sprintf ".libPaths( c( .libPaths(), \"%s\") )" (pkgpath.Replace("\\","\\\\"))) |> ignore
 
+  try 
+    rengine.Evaluate("library(tidyverse)") |> ignore
+    rengine.Evaluate("library(codetools)") |> ignore
+  with e -> printfn "Packages failed: %A" e
   rengine.Evaluate("""
     showTree <- function(e, write = cat) {
       w <- makeCodeWalker(call = showTreeCall, leaf = showTreeLeaf,
@@ -62,10 +66,6 @@ let worker = System.Threading.Thread(fun () ->
     }  
   """) |> ignore
   rengine.Evaluate("dataStore <- list()") |> ignore
-  try 
-    rengine.Evaluate("library(tidyverse)") |> ignore
-    rengine.Evaluate("library(codetools)") |> ignore
-  with e -> printfn "Packages failed: %A" e
 
   let knownNames = 
     rengine.Evaluate("search()").AsCharacter() 
