@@ -241,6 +241,7 @@ let evaluateAndParse hash frames code rengine =
     let results = evaluate hash frames code rengine
     logf "Success. Results (%s): %A" (String.concat "," (List.map fst results)) results
     [ for var, df in results ->
+        logf "Reading data for frame: %s" var
         let data = 
           [| for row in df.GetRows() ->
                df.ColumnNames |> Array.map (fun c -> c, formatValue row.[c]) |> JsonValue.Record |] 
@@ -257,7 +258,9 @@ let evaluateAndParse hash frames code rengine =
 
 let evaluateAndStore hash frames code = async {
   let! results = withREngine (evaluateAndParse hash frames code)
+  logf "Storing resulting data frames"
   for var, _, data in results do do! storeDataset hash var data 
+  logf "Resulting data frames uploaded"
   return [ for var, typ, _ in results -> var, typ ] }
 
 let source = """
