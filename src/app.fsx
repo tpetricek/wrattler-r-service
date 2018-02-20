@@ -246,11 +246,14 @@ let evaluateAndParse hash frames code rengine =
           [| for row in df.GetRows() ->
                df.ColumnNames |> Array.map (fun c -> c, formatValue row.[c]) |> JsonValue.Record |] 
           |> JsonValue.Array
+        logf ".. got data %d" (data.AsArray().Length)
         let row = df.GetRows() |> Seq.tryHead
+        logf ".. got row"
         let tys = 
           match row with
           | Some row -> df.ColumnNames |> Array.map (fun c -> c, formatType(row.[c].GetType()))
           | None -> df.ColumnNames |> Array.map (fun c -> c, "object")
+        logf ".. got types"
         var, tys, data.ToString() ]
   with e ->
     logf "Failed to evluate! %A" e
