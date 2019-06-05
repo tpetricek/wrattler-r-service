@@ -17,8 +17,8 @@ open System
 open RDotNet
 open FSharp.Data
 
-//let dataStoreUrl = "http://localhost:7102"
-let dataStoreUrl = "https://wrattler-data-store.azurewebsites.net"
+let dataStoreUrl = "http://localhost:7102"
+//let dataStoreUrl = "https://wrattler-data-store.azurewebsites.net"
 let logger = Targets.create Verbose [||]
 let logf fmt = Printf.kprintf (fun s -> logger.info(Message.eventX s)) fmt
 
@@ -26,9 +26,24 @@ let logf fmt = Printf.kprintf (fun s -> logger.info(Message.eventX s)) fmt
 // Thread-safe R engine access
 // ------------------------------------------------------------------------------------------------
 
+type CaptureDevice() = 
+  inherit Devices.ConsoleDevice()
+  let mutable sb : System.Text.StringBuilder = null
+  interface Devices.ICharacterDevice with
+    override x.WriteConsole(output, length, typ) = 
+      if sb <> null then sb.Append(output) |> ignore
+      else base.WriteConsole(output, length, typ)
+  member this.BeginCapture() =
+    sb <- System.Text.StringBuilder()
+  member this.EndCapture() : string =
+    let res = sb.ToString()
+    sb <- null
+    res
+
 type RContext = 
   { REngine : REngine
-    KnownNames : Set<string> }
+    KnownNames : Set<string> 
+    Device : CaptureDevice }
 
 let queue = new System.Collections.Concurrent.BlockingCollection<_>()
 let worker = System.Threading.Thread(fun () -> 
@@ -38,10 +53,10 @@ let worker = System.Threading.Thread(fun () ->
   let path = System.Environment.GetEnvironmentVariable("PATH")
   System.Environment.SetEnvironmentVariable("PATH", sprintf "%s;%s/bin/x64" path rpath)
   System.Environment.SetEnvironmentVariable("R_HOME", rpath)
-  let rengine = REngine.GetInstance(rpath + "/bin/x64/R.dll", AutoPrint=false)
+  let dev = CaptureDevice()
+  let rengine = REngine.GetInstance(rpath + "/bin/x64/R.dll", AutoPrint=false, device=dev)
   //rengine.Evaluate(".libPaths( c( .libPaths(), \"C:\\\\Users\\\\tomas\\\\Documents\\\\R\\\\win-library\\\\3.4\") )") |> ignore
   rengine.Evaluate(sprintf ".libPaths( c(\"%s\") )" (pkgpath.Replace("\\","\\\\"))) |> ignore
-
   try 
     rengine.Evaluate("library(tidyverse)") |> ignore
     rengine.Evaluate("library(codetools)") |> ignore
@@ -72,16 +87,16 @@ let worker = System.Threading.Thread(fun () ->
     logf "Failed getting expression tree: %A" e
   rengine.Evaluate("dataStore <- list()") |> ignore
 
-
   let knownNames = 
     rengine.Evaluate("search()").AsCharacter() 
     |> Seq.collect (fun pkg -> rengine.Evaluate(sprintf "ls(\"%s\")" pkg).AsCharacter()) 
     |> set
-  let ctx = { REngine = rengine; KnownNames = knownNames }
+  let ctx = { REngine = rengine; KnownNames = knownNames; Device = dev }
   while true do 
     let op = queue.Take() 
     try op ctx
-    with e -> printf "Operation failed: %A" e)
+    with e -> printf "Operation failed: %A" e
+  )
 worker.Start()
 
 let withRContext op = 
@@ -189,7 +204,7 @@ let retrieveFrames frames = async {
 // Calling data store
 // ------------------------------------------------------------------------------------------------
 
-let evaluate hash frames code (rengine:REngine) = 
+let evaluate hash frames code (dev:CaptureDevice) (rengine:REngine) = 
 
   let mainEnv = rengine.Evaluate("new.env()").AsEnvironment()
   let tmpEnv = rengine.Evaluate("new.env()").AsEnvironment()
@@ -201,10 +216,12 @@ let evaluate hash frames code (rengine:REngine) =
     let df = rengine.Evaluate(expr:string).AsDataFrame()
     rengine.SetSymbol(name, df)
 
-//  rengine.Evaluate(code)
-  //rengine.Evaluate("1+2")
+  dev.BeginCapture()
   let code = sprintf "with(mainEnv, { %s })" code
   rengine.Evaluate(code) |> ignore
+  let consoleOut = dev.EndCapture()
+
+  consoleOut,
   [ for var in rengine.Evaluate("ls(mainEnv)").AsCharacter() ->
       if not (knownFrames.Contains(var)) then
         try
@@ -241,11 +258,12 @@ test <- bb2015fix %>%
 # glm(`Urban/rural`~., family=binomial(link='logit'), data=training)
 """
 *)
-let evaluateAndParse hash frames code rengine = 
+let evaluateAndParse hash frames code ctx = 
   try
     logf "Evaluating: %s" code
-    let results = evaluate hash frames code rengine
+    let out, results = evaluate hash frames code ctx.Device ctx.REngine
     logf "Success. Results (%s): %A" (String.concat "," (List.map fst results)) results
+    out,
     [ for var, df in results ->
         logf "Reading data for frame: %s" var
         let rawRows = df.GetRows() |> Array.ofSeq
@@ -272,11 +290,11 @@ let evaluateAndParse hash frames code rengine =
     reraise ()
 
 let evaluateAndStore hash frames code = async {
-  let! results = withREngine (evaluateAndParse hash frames code)
+  let! consoleOut, results = withRContext (evaluateAndParse hash frames code)
   logf "Storing resulting data frames"
   for var, _, data in results do do! storeDataset hash var data 
   logf "Resulting data frames uploaded"
-  return [ for var, typ, _ in results -> var, typ ] }
+  return consoleOut, [ for var, typ, _ in results -> var, typ ] }
 
 let source = """
 colnames(bb2014) <- c("Urban","Down","Up","Latency","Web")
@@ -350,9 +368,9 @@ type ExportsResponseJson = JsonProvider<"""
   { "exports": ["foo","bar"],
     "imports": ["foo","bar"] }""">
 
-type EvalResponseJson = JsonProvider<"""[
-  { "name":"foo",
-    "url":"http://datastore/123" } ]""">
+type EvalResponseJson = JsonProvider<"""
+  { "output": "Captured console output",
+    "frames": [ { "name":"foo", "url":"http://datastore/123" } ] }""">
 
 type EvalRequestJson = JsonProvider<"""{ 
   "code":"a <- b", "hash":"0x123456",
@@ -376,11 +394,11 @@ let app =
       let req = EvalRequestJson.Parse(System.Text.UTF32Encoding.UTF8.GetString(ctx.request.rawForm))
       logf "Evaluating code (%s) with frames: %A" req.Hash [ for f in req.Frames -> f.Name]
       let! frames = retrieveFrames [ for f in req.Frames -> f.Name, f.Url ]
-      let! rdata = evaluateAndStore req.Hash frames req.Code
-      let res = 
-        [| for var, _ in rdata -> EvalResponseJson.Root(var, sprintf "%s/%s/%s" dataStoreUrl req.Hash var).JsonValue |]
-        |> JsonValue.Array
-      logf "Evaluated code (%s): %A" req.Hash [ for var, _ in rdata -> sprintf "%s/%s" req.Hash var ]
+      let! consoleOut, rdata = evaluateAndStore req.Hash frames req.Code
+      let frames = 
+        [| for var, _ in rdata -> EvalResponseJson.Frame(var, sprintf "%s/%s/%s" dataStoreUrl req.Hash var) |]
+      let res = EvalResponseJson.Root(consoleOut, frames)
+      logf "Evaluated code (%s): Console out: %s\nFrames: %A" req.Hash consoleOut [ for var, _ in rdata -> sprintf "%s/%s" req.Hash var ]
       return! Successful.OK (res.ToString()) ctx }
 
     POST >=> path "/exports" >=> fun ctx -> async {
